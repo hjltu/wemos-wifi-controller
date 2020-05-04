@@ -1,0 +1,26 @@
+
+http://arduino.esp8266.com/stable/package_esp8266com_index.json
+
+# mqtt
+https://pubsubclient.knolleary.net/api.html
+
+# install
+
+default:
+name: "wemos"
+ssid: "hjhome"
+pass: "pass1234"
+msrv: "192.168.0.10"
+
+./winit.sh msrv new_name new_ssid new_pass ner_srv
+
+
+
+
+
+
+
+
+
+
+
