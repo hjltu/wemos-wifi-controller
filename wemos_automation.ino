@@ -40,6 +40,10 @@
 // 23-jan-19 fix shutters one second step
 // 25jul26 add ap mode
 // 29jul26 add temp,tmp,hum simulation
+// 13aug26 add min,max temp, add NTC Resistor
+// 29aug26 change eeprom write
+// 30aug26 add pid controller
+
 
 // D0   GPIO16
 // D1   GPIO5
@@ -69,7 +73,7 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 
-const char* vers = "23-jul-26";
+const char* vers = "30-Aug-26";
 
 // default settings
 String str_name = "wemos";
@@ -104,18 +108,21 @@ DallasTemperature sensors(&oneWire);
 //DHT pin
 DHT dht(4, DHT22, 15);
 
-//  check symbols
-String my_base64="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
-
+// eeprom string size
 const int BUFSIZE = 20;
-//char buf[BUFSIZE];
 
-bool bt[18],rele[18],net_default,http,term,count;
+bool bt[18],rele[18],net_default,http,count;
 bool state,period,blinds,shutters,buttons,sensor;
-bool revers,net_ap_mode;
+bool revers,net_ap_mode,an_ntc,pid_rev;
 byte ac_pwm[18],pwm[18],gap,my_mqtt[4];
 byte somfy,ac_somfy,shut,ac_shut;
-int temp,hum,tmp,sn,an,bcount[18],pin;
+int term,temp,hum,tmp,an,sn,bcount[18],pin;
+int temp_max=33, temp_min=11, temp_ntc=22;
+int pid, pid_ku, pid_tu, pid_integral, pid_last_error;
+int RELE_DEAD_BAND = 9999, pid_last_switch, pid_input=22;
+int PID_INTEGRAL_MIN=-255, PID_INTEGRAL_MAX=255;
+int8_t pid_set;
+float pid_ku_float;
 
 unsigned long lcount[18],rcount[18];
 unsigned long stop_count,scount,shcount;
@@ -154,7 +161,6 @@ void setup()
         Serial.printf("Set Default Network: Name: %s, SSID: %s, PASS: %s, MQTT: %s\n",
             str_name, str_ssid, str_pass.c_str(), mqtt_server.toString().c_str());
     }
-    // TODO test AP mode
     if(net_ap_mode==true)
     {
         str_ssid = ap_ssid;
@@ -182,6 +188,20 @@ void setup()
     Serial.println(revers);
     Serial.print("term: ");
     Serial.println(term);
+    Serial.print("min: ");
+    Serial.println(temp_min);
+    Serial.print("max: ");
+    Serial.println(temp_max);
+    Serial.print("pid: ");
+    Serial.println(pid);
+    Serial.print("pid_revers: ");
+    Serial.println(pid_rev);
+    Serial.print("pid_ku: ");
+    Serial.println(pid_ku_float);
+    Serial.print("pid_tu: ");
+    Serial.println(pid_tu);
+    Serial.print("pid_set: ");
+    Serial.println(pid_set);
     Serial.print("count: ");
     Serial.println(count);
     Serial.print("buttons: ");
@@ -190,6 +210,8 @@ void setup()
     Serial.println(gap);
     Serial.print("sensor: ");
     Serial.println(sensor);
+    Serial.print("ntc: ");
+    Serial.println(an_ntc);
     Serial.print("default: ");
     Serial.println(net_default);
     Serial.print("apmode: ");
@@ -223,6 +245,15 @@ void my_eeprom_states()
     shutters=EEPROM.read(110);
     revers=EEPROM.read(111);
     net_ap_mode=EEPROM.read(112);
+    temp_min=EEPROM.read(113);
+    temp_max=EEPROM.read(114);
+    an_ntc=EEPROM.read(115);
+    pid=EEPROM.read(116);
+    pid_rev=EEPROM.read(117);
+    pid_ku=EEPROM.read(118);
+    pid_tu=EEPROM.read(119);
+    pid_set=(int8_t)EEPROM.read(120);
+    pid_ku_float=my_float10(pid_ku);
 }
 
 void my_pin_mode()
@@ -350,16 +381,22 @@ void loop()
         if(millis()%(1700*(gap+1))==0)
             my_analog();
     if(blinds==0 && buttons==0)
+    {
         if(millis()%9==0)
             my_pwm();
+
+        if(pid>0)
+            if(millis()%(1111*(gap+1))==0)
+                my_pid();
+    }
     if(blinds==1 && buttons==0)
         my_somfy();
     if(term==0 && shutters==1)
         my_shutters();
-    if(term==1 && shutters==0)
-        if(millis()%80000==0)
+    if(term>0 && shutters==0)
+        if(millis()%(RELE_DEAD_BAND*(gap+1))==0)
             my_term();
-    if(millis()%90000==0)
+    if(millis()%99999==0)
         my_memory();
     my_rele(14);
     my_rele(16);
@@ -521,16 +558,28 @@ client.println(F("<br>blinds - set out12, out13 for blinds(somfy) | 0/1"));
 client.println(F("<br>buttons - set out12, out13 for buttons | 0/1"));
 client.println(F("<br>shutters - set out14, out16 for shutters | 0/1"));
 client.println(F("<br>revers - set reversed output for out14, out16 | 0/1"));
-client.println(F("<br>term - set anti freezing function for temp4<8&#x2103 and rele14"));
-client.println(F("<br>    overheating function for temp4>33&#x2103 and rele16 | 0/1"));
+client.println(F("<br>term - set antifreezing function: min&#x2103 for rele14"));
+client.println(F("<br>  term - set overheating function: max&#x2103 for rele16 | 0-3"));
+client.println(F("<br>  term - set 0 - disable, 1 - DS18b20, 2 - DHT, 3 - NTC"));
+client.println(F("<br>min - term setpoint for antifreezing | 0-99"));
+client.println(F("<br>max - term setpoint overheating | 0-99"));
+client.println(F("<br>pid_mode - set pid function: for pwm12,13 | 0-5"));
+client.println(F("<br>  pid_mode - output: pwm12 - 0-255, pwm13 - discrete (on/off)"));
+client.println(F("<br>  pid_mode - 0 - disable, 1 - DS18b20, 2 -DHT, 3 - NTC, 4 - analog, 5 - MQTT"));
+client.println(F("<br>  pid_rev - set pid reverse acting | 0/1"));
+client.println(F("<br>  pid_ku - set pid ultimate gain ku/10 | 1-255"));
+client.println(F("<br>  pid_tu - set pid ultimate period (sec) | 0-255"));
+client.println(F("<br>  pid_set - set pid setpoint | -99-111"));
+client.println(F("<br>  pid_input - set pid MQTT source, default=22 | -255-255"));
 client.println(F("<br>count - set counter for in0, in2 | 0/1"));
 client.println(F("<br>value0,1,2,3 - set unsigned long | 0 - 2147483647"));
 client.println(F("<br>gap - set interval 6(2)sec-30(7)min for sensors temp,tmp,hum,(an) | 0 - 255"));
 client.println(F("<br>period - set send temp5,temp4,hum4,an0 stat periodicaly | 0/1"));
 client.println(F("<br>sensor - set analog input an0(A0)  | 0/1"));
+client.println(F("<br>ntc - set A0 as NTC Resistor 10k, Pull-down 15-35&#x2103  | 0/1"));
 client.println(F("<br>default - set default network settings | 0/1"));
-client.println(F("<br>    press bt0 and bt2 for 20 sec to reset(default)"));
-client.println(F("<br>    press bt0 and bt2 for 20 sec to reset(default AP mode)"));
+client.println(F("<br>  press bt0 and bt2 for 20 sec to reset(default)"));
+client.println(F("<br>  press bt0 and bt2 for 20 sec to reset(default AP mode)"));
 client.println(F("<br>apmode - set default Access Point Mode 0/1"));
 client.println(F("<br>_temp5 - simulate ds18b20 sensor | -100 - 100"));
 client.println(F("<br>_tmp4, _hum4 - simulate dht22 sensor | -100 - 100"));
@@ -677,6 +726,10 @@ client.print(F("<tr><th>A0</th><th>Sensor</th><th>/"));
 client.print(str_name);
 client.print(F("/in/an0</th><th>1-1024</th><th>"));
 client.print(an);
+client.print(F("<tr><th>A0</th><th>Ntc</th><th>/"));
+client.print(str_name);
+client.print(F("/in/temp_ntc</th><th>15-35&#x2103</th><th>"));
+client.print(temp_ntc);
 client.print(F("<tr><th>A0</th><th>Button</th><th>/"));
 client.print(str_name);
 client.print(F("/in/bt17</th><th>0,1,2</th><th>"));
@@ -711,8 +764,42 @@ client.print(F("/in/buttons</th><th>0,1</th><th>"));
 client.print(buttons);
 client.println(F("</th></tr><tr><th>EEPROM</th><th>term</th><th>/"));
 client.print(str_name);
-client.print(F("/in/term</th><th>0,1</th><th>"));
+client.print(F("/in/term</th><th>0-3</th><th>"));
 client.print(term);
+client.println(F("</th></tr><tr><th>EEPROM</th><th>min</th><th>/"));
+client.print(str_name);
+client.print(F("/in/min</th><th>0-99</th><th>"));
+client.print(temp_min);
+client.println(F("</th></tr><tr><th>EEPROM</th><th>max</th><th>/"));
+client.print(str_name);
+client.print(F("/in/max</th><th>0-99</th><th>"));
+client.print(temp_max);
+
+client.println(F("</th></tr><tr><th>EEPROM</th><th>pid_mode</th><th>/"));
+client.print(str_name);
+client.print(F("/in/pid_mode</th><th>0-5</th><th>"));
+client.print(pid);
+client.println(F("</th></tr><tr><th>EEPROM</th><th>pid_rev</th><th>/"));
+client.print(str_name);
+client.print(F("/in/pid_rev</th><th>0,1</th><th>"));
+client.print(pid_rev);
+client.println(F("</th></tr><tr><th>EEPROM</th><th>pid_ku</th><th>/"));
+client.print(str_name);
+client.print(F("/in/pid_ku</th><th>1-255</th><th>"));
+client.print(pid_ku_float);
+client.println(F("</th></tr><tr><th>EEPROM</th><th>pid_tu</th><th>/"));
+client.print(str_name);
+client.print(F("/in/pid_tu</th><th>0-255</th><th>"));
+client.print(pid_tu);
+client.println(F("</th></tr><tr><th>EEPROM</th><th>pid_set</th><th>/"));
+client.print(str_name);
+client.print(F("/in/pid_set</th><th>-99-111</th><th>"));
+client.print(pid_set);
+client.println(F("</th></tr><tr><th>RAM</th><th>pid_input</th><th>/"));
+client.print(str_name);
+client.print(F("/in/pid_input</th><th>-255-255</th><th>"));
+client.print(pid_input);
+
 client.println(F("</th></tr><tr><th>EEPROM</th><th>count</th><th>/"));
 client.print(str_name);
 client.print(F("/in/count</th><th>0,1</th><th>"));
@@ -725,6 +812,10 @@ client.println(F("</th></tr><tr><th>EEPROM</th><th>sensor</th><th>/"));
 client.print(str_name);
 client.print(F("/in/sensor</th><th>0,1</th><th>"));
 client.print(sensor);
+client.println(F("</th></tr><tr><th>EEPROM</th><th>ntc</th><th>/"));
+client.print(str_name);
+client.print(F("/in/ntc</th><th>0,1</th><th>"));
+client.print(an_ntc);
 client.println(F("</th></tr><tr><th>EEPROM</th><th>default</th><th>/"));
 client.print(str_name);
 client.print(F("/in/default</th><th>0,1</th><th>"));
@@ -996,7 +1087,7 @@ void callback(const MQTT::Publish& pub)
     }
     if(inc_topic.indexOf("/term")>0)
     {
-        if(inc_payload=="1" || inc_payload=="0")
+        if(inc_payload.toInt() >=0 && inc_payload.toInt() <= 3)
         {
             ee_wr(104,inc_payload.toInt());
             ee_wr(110,0);   // shutters
@@ -1005,11 +1096,101 @@ void callback(const MQTT::Publish& pub)
         str_payload = String(EEPROM.read(104));
         my_print();
     }
+    if(inc_topic.indexOf("/min")>0)
+    {
+        if(inc_payload.toInt() >= 0 && inc_payload.toInt() <= 99 && inc_payload.toInt() < temp_max)
+        {
+            temp_min = inc_payload.toInt();
+            ee_wr(113, temp_min);
+        }
+        str_topic = String("/" + str_name + "/out/min");
+        str_payload = String(EEPROM.read(113));
+        my_print();
+    }
+    if(inc_topic.indexOf("/max")>0)
+    {
+        if(inc_payload.toInt() >= 0 && inc_payload.toInt() <= 99 && inc_payload.toInt() > temp_min)
+        {
+            temp_max = inc_payload.toInt();
+            ee_wr(114, temp_max);
+        }
+        str_topic = String("/" + str_name + "/out/max");
+        str_payload = String(EEPROM.read(114));
+        my_print();
+    }
+    if(inc_topic.indexOf("/pid_mode")>0)
+    {
+        if(inc_payload.toInt() >=0 && inc_payload.toInt() <= 5)
+        {
+            ee_wr(116,inc_payload.toInt());
+            ee_wr(103,0);   // blinds
+            ee_wr(106,0);   // buttons
+        }
+        str_topic = String("/" + str_name + "/out/pid");
+        str_payload = String(EEPROM.read(116));
+        my_print();
+    }
+    if(inc_topic.indexOf("/pid_rev")>0)
+    {
+        if((inc_payload=="1" || inc_payload=="0"))
+        {
+            pid_rev = inc_payload.toInt();
+            ee_wr(117, pid_rev);
+        }
+        str_topic = String("/" + str_name + "/out/pid_rev");
+        str_payload = String(pid_rev);
+        my_print();
+    }
+    if(inc_topic.indexOf("/pid_ku")>0)
+    {
+        if(inc_payload.toInt() > 0 && inc_payload.toInt() <= 255)
+        {
+            pid_ku = inc_payload.toInt();
+            ee_wr(118, pid_ku);
+            pid_ku_float = my_float10(pid_ku);
+        }
+        str_topic = String("/" + str_name + "/out/pid_ku");
+        str_payload = String(pid_ku_float);
+        my_print();
+    }
+    if(inc_topic.indexOf("/pid_tu")>0)
+    {
+        if(inc_payload.toInt() >= 0 && inc_payload.toInt() <= 255)
+        {
+            pid_tu = inc_payload.toInt();
+            ee_wr(119, pid_tu);
+        }
+        str_topic = String("/" + str_name + "/out/pid_tu");
+        str_payload = pid_tu;
+        my_print();
+    }
+    if(inc_topic.indexOf("/pid_set")>0)
+    {
+        if(inc_payload.toInt() >= -99 && inc_payload.toInt() <= 111)
+        {
+            pid_set = inc_payload.toInt();
+            ee_wr(120, pid_set);
+        }
+        str_topic = String("/" + str_name + "/out/pid_set");
+        str_payload = pid_set;
+        my_print();
+    }
+    if(inc_topic.indexOf("/pid_input")>0)
+    {
+        if(inc_payload.toInt() >= -255 && inc_payload.toInt() <= 255)
+        {
+            pid_input = inc_payload.toInt();
+        }
+        str_topic = String("/" + str_name + "/out/pid_input");
+        str_payload = pid_input;
+        my_print();
+    }
+
     if(inc_topic.indexOf("/count")>0)
     {
         if(inc_payload=="1" || inc_payload=="0")
         {
-            count=inc_payload.toInt();
+            count = inc_payload.toInt();
             ee_wr(105,count);
         }
         str_topic = String("/" + str_name + "/out/count");
@@ -1020,7 +1201,7 @@ void callback(const MQTT::Publish& pub)
     {
         if(inc_payload.toInt() >= 0 && inc_payload.toInt() <= 255)
         {
-            gap=inc_payload.toInt();
+            gap = inc_payload.toInt();
             ee_wr(107,gap);
         }
         str_topic = String("/" + str_name + "/out/gap");
@@ -1031,11 +1212,22 @@ void callback(const MQTT::Publish& pub)
     {
         if((inc_payload=="1" || inc_payload=="0"))
         {
-            sensor=inc_payload.toInt();
+            sensor = inc_payload.toInt();
             ee_wr(108,sensor);
         }
         str_topic = String("/" + str_name + "/out/sensor");
         str_payload = String(sensor);
+        my_print();
+    }
+    if(inc_topic.indexOf("/ntc")>0)
+    {
+        if((inc_payload=="1" || inc_payload=="0"))
+        {
+            an_ntc=inc_payload.toInt();
+            ee_wr(115,an_ntc);
+        }
+        str_topic = String("/" + str_name + "/out/ntc");
+        str_payload = String(an_ntc);
         my_print();
     }
 
@@ -1162,23 +1354,85 @@ void my_rele(int i)
 void my_term()
 // Automatic anti freeze or over heat protection depends of ds18b20
 {
+    int curr_temp = 22;
+    if(term==1)
+        curr_temp = temp;   // DS18B20
+    if(term==2)
+        curr_temp = tmp;    // DHT
+    if(term==3)
+        curr_temp = temp_ntc;   // NTC
 // heating
-    int i=14, min=9, max=33, gist=2;
-    if(temp<min)
+    int i=14;
+    if(curr_temp < temp_min)
         rele[i]=true;
-    if(temp>min+gist)
-        rele[i]=0;
+    if(curr_temp > temp_min)
+        rele[i]=false;
     str_topic = String("/" + str_name + "/out/rele" + i);
     str_payload = String(rele[i]);
     my_print();
 // cooling
     i=16;
-    if(temp>max)
+    if(curr_temp > temp_max)
         rele[i]=true;
-    if(temp<max-gist)
+    if(curr_temp < temp_max)
         rele[i]=false;
     str_topic = String("/" + str_name + "/out/rele" + i);
     str_payload = String(rele[i]);
+    my_print();
+}
+
+void my_pid()
+// input: pid, pid_tu, pid_set, pid_input, pid_integral, pid_last_error
+// out: PWM D12, pwm[12] 0-255 and relay D14 pwm[14] 0,255
+{
+    float input = 0;
+    if(pid==1)
+        input = temp;   // DS18B20
+    if(pid==2)
+        input = tmp;    // DHT
+    if(pid==3)
+        input = temp_ntc;   // NTC
+    if(pid==4)
+        input = an;      // analog input
+    if(pid==5)
+        input = pid_input;   // mqtt
+
+    float kp = 0.6 * pid_ku_float;
+    float ki=0, kd=0;
+    if(pid_tu > 0)
+    {
+        ki = 1.2 * pid_ku_float / pid_tu;
+        kd = 0.075 * pid_ku_float * pid_tu;
+    }
+
+    int error = pid_set - input;
+    if(pid_rev==1)
+        error = input - pid_set;
+    pid_integral += error;
+    pid_integral = constrain(pid_integral, PID_INTEGRAL_MIN, PID_INTEGRAL_MAX);
+    int derivative = error - pid_last_error;
+    float output = kp*error + ki*pid_integral + kd*derivative;
+    pid_last_error = error;
+
+    if(millis() > pid_last_switch + RELE_DEAD_BAND)
+    {
+        if(output > 0)
+            pwm[13] = 255;
+        else
+            pwm[13] = 0;
+        pid_last_switch = millis();
+        str_topic = String("/" + str_name + "/out/pwm" + 13);
+        str_payload = String(pwm[13]);
+        my_print();
+    }
+
+    pwm[12] = constrain((int)output, 0, 255);
+    str_topic = String("/" + str_name + "/out/pwm" + 12);
+    str_payload = String(pwm[12]);
+    my_print();
+
+    str_topic = String("/" + str_name + "/out/pid_out");
+    str_payload = output;
     my_print();
 }
 
@@ -1292,20 +1546,27 @@ void my_dht()
 void my_analog()
 {
     an=0;
-    for(int j=0; j<10;j++)
+    for(int j=0; j<9;j++)
     {
         an+=analogRead(A0);
         delay(1);
     }
-    an=an/10;
+    an=an/9;
     str_topic = String("/" + str_name + "/out/an0");
     str_payload = String(an);
     my_print();
+    if(an_ntc==1)
+    {
+        temp_ntc = 25.0 + (512.0 - an) * 0.085;
+        str_topic = String("/" + str_name + "/out/temp_ntc");
+        str_payload = String(temp_ntc);
+        my_print();
+    }
 }
 
 void my_pwm()
 {
-    for(int i=12; i<14; i++)    // TODO i+=2
+    for(int i=12; i<14; i++)
     {
         if(ac_pwm[i] != pwm[i])
         {
@@ -1417,6 +1678,11 @@ void somfy_open()
     scount=millis();
 }
 
+float my_float10(int i)
+{
+    return (float)i/10;
+}
+
 void ee_wr(int addr, int val)
 {
     if(EEPROM.read(addr) != val)
@@ -1443,26 +1709,30 @@ String my_str_read(String name, int shift)
         return(name);
 }
 
-// TODO test base64 comparsion
+// TODO test eeprom write/read
 void my_str_write(String name, int shift)
 {
+    for (unsigned int i = 0; i < name.length(); i++)
+        if (!isprint(name[i]))
+        {
+            Serial.print(F("ERR: String contains non-printable character"));
+            return;
+        }
+
     char buf[BUFSIZE];
     name.toCharArray(buf,BUFSIZE);
+    for (int i = name.length(); i < BUFSIZE; i++)
+        buf[i] = '\0';
     Serial.print(F("buf write="));
     Serial.println(String(buf));
+
     for(int i=0; i<=BUFSIZE; i++)
     {
-        if(my_base64.indexOf(String(buf[i]))>0)
-        {
-            Serial.println(String(buf[i]));
-            EEPROM.write(i+shift,buf[i]);
-        }
-        else
-            Serial.print(F("ERR: symbol="));
-            Serial.println(String(buf[i]));
-            //EEPROM.write(i+shift,buf[i]);
-            return;
+        Serial.print(F("MSG: eeprom write="));
+        Serial.println(String(buf[i]));
+        EEPROM.write(i+shift,buf[i]);
     }
+    Serial.print(F("MSG: eeprom commit"));
     EEPROM.commit();
 }
 
