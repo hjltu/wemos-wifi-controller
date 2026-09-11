@@ -1,7 +1,7 @@
 # Wemos Automation - Developer Documentation
 
 **Project:** hjhome / wemos_automation
-**Version:** 23-jul-26 (July 26, 2023)
+**Version:** 30-Aug-26 (August 30, 2026)
 **Author:** hjltu@ya.ru
 **License:** GNU GPL v3
 **Target Hardware:** ESP8266 (Wemos D1 mini / NodeMCU V3)
@@ -17,6 +17,7 @@ MQTT-controlled home automation node** supporting:
 - PWM dimming (LED strips)
 - Somfy RTS blind/shutter control
 - Motorized shutter position control
+- PID temperature control (PWM)
 - Temperature/humidity monitoring (DS18B20, DHT22)
 - Analog sensor reading (0-5V or 0-10V via divider)
 - Pulse counting (water/gas/electricity meters)
@@ -57,6 +58,7 @@ persistence are critical.
 |  +-- Somfy blind state machine                              |
 |  +-- Shutter position control                               |
 |  +-- Anti-freeze/overheat protection                        |
+|  +-- PID control loop (if pid > 0)
 |  +-- Memory watchdog (reset if heap < 10KB)                 |
 |  +-- Hardware reset detection (dual-button 20s/30s hold)    |
 +-------------------------------------------------------------+
@@ -67,7 +69,7 @@ persistence are critical.
 | Group | Modes | EEPROM Addr | Description |
 |-------|-------|-------------|-------------|
 | **Network** | `default`, `apmode` | 109, 112 | WiFi/MQTT source selection |
-| **GPIO12/13** | `blinds`, `buttons` | 103, 106 | Somfy vs Button inputs |
+| **GPIO12/13** | `blinds`, `buttons`, `pid` | 103, 106, 116 | Somfy vs Button vs PID control |
 | **GPIO14/16** | `shutters`, `term` | 110, 104 | Shutter motor vs Thermal protection |
 | **Sensors** | `period`, `sensor`, `count` | 101, 108, 105 | Periodic, analog, pulse count |
 
@@ -87,6 +89,47 @@ MQTT topics allow injecting simulated sensor values (added 29-jul-26):
 These are **input-only** (no EEPROM persist), useful for testing logic
 without physical sensors. Published back on `/out/tmp4`, `/out/hum4`,
 `/out/temp5` respectively.
+
+**Behavior:** When a simulation value is set via MQTT, the corresponding
+sensor reading function (`my_dht()` for tmp4/hum4, `my_temp()` for temp5)
+will use the simulated value instead of reading hardware. The simulated
+value persists until overwritten or device reboot. The periodic publishing
+(via `period=1`) will report the simulated values.
+
+**Use Cases:**
+- Testing automation logic without physical sensors
+- Simulating extreme temperatures for thermal protection testing
+- Verifying MQTT payload formatting and topic routing
+- CI/CD pipeline testing with mocked hardware
+
+### 2.4 NTC Resistor Support (Added 13-aug-26)
+
+The firmware supports a 10k NTC thermistor (Negative Temperature Coefficient)
+connected to **A0 (ADC)** with a pull-down resistor configuration.
+
+**Hardware:**
+- NTC 10k between A0 and 3.3V
+- Pull-down resistor (typically 10k) between A0 and GND
+- Forms voltage divider, readable via `analogRead(A0)`
+
+**Configuration:**
+- Enable via MQTT: `/<name>/in/ntc` = `1` (stored in EEPROM addr 115)
+- When enabled, `an_ntc=1` activates temperature calculation in `my_analog()`
+- Measurement range: approximately 15-35°C (limited by ADC resolution)
+
+**Calculation Formula:**
+```cpp
+temp_ntc = 25.0 + (512.0 - an) * 0.085;
+```
+Where `an` is the averaged ADC reading (0-1023, averaged over 10 samples).
+The formula assumes 25°C at midpoint (512) with linear approximation.
+
+**Output:** Publishes to `/<name>/out/temp_ntc` when `sensor=1` and `ntc=1`
+(interval: `1700*(gap+1)` ms). Also visible on web status page.
+
+**Note:** NTC mode shares A0 with analog sensor input. When `ntc=1`,
+the raw analog value is still published to `/out/an0`, but the
+interpretation shifts to temperature.
 
 ---
 
@@ -158,6 +201,14 @@ without physical sensors. Published back on `/out/tmp4`, `/out/hum4`,
 | 110 | 1 | bool | `shutters` - GPIO14/16 as shutter motor |
 | 111 | 1 | bool | `revers` - invert relay logic |
 | 112 | 1 | bool | `net_ap_mode` - run as AP |
+| 113 | 1 | byte | `temp_min` - antifreeze setpoint (0-99) |
+| 114 | 1 | byte | `temp_max` - overheat setpoint (0-99) |
+| 115 | 1 | bool | `an_ntc` - enable NTC resistor on A0 |
+| 116 | 1 | bool | `pid` - enable PID control |
+| 117 | 1 | bool | `pid_rev` - PID reverse acting |
+| 118 | 1 | byte | `pid_ku` - ultimate gain (ku/10) |
+| 119 | 1 | byte | `pid_tu` - ultimate period (sec) |
+| 120 | 1 | byte | `pid_set` - PID setpoint (-99 to 111) |
 | 200-219 | 20 | char | WiFi SSID (str_ssid) |
 | 220-239 | 20 | char | WiFi Password (str_pass) |
 
@@ -208,6 +259,13 @@ All settings persist to EEPROM immediately on change.
 | Pulse count | `/<name>/in/count` | `0\|1` | bool | Count pulses on GPIO0/2 |
 | Sensor interval | `/<name>/in/gap` | `0-255` | byte | Multiplier: base 6.6s/7.7s/1.7s |
 | Analog publish | `/<name>/in/sensor` | `0\|1` | bool | Periodic A0 publish |
+| NTC resistor | `/<name>/in/ntc` | `0\|1` | bool | Enable 10k NTC on A0 (15-35°C) |
+| PID mode | `/<name>/in/pid_mode` | `0-5` | byte | PID controller source (0=off, 1=DS18, 2=DHT, 3=NTC, 4=Analog, 5=MQTT) |
+| PID reverse | `/<name>/in/pid_rev` | `0\|1` | bool | PID reverse acting |
+| PID gain | `/<name>/in/pid_ku` | `1-255` | byte | Ultimate gain ku/10 |
+| PID period | `/<name>/in/pid_tu` | `0-255` | byte | Ultimate period (sec) |
+| PID setpoint | `/<name>/in/pid_set` | `-99..111` | int | Target temperature |
+| PID input | `/<name>/in/pid_input` | `-255..255` | int | External MQTT setpoint |
 
 ### 6.3 Output Control (Runtime)
 
@@ -255,10 +313,18 @@ All settings persist to EEPROM immediately on change.
 | `buttons` | `0\|1` | `/out/buttons` | Enable button mode (disables blinds) |
 | `shutters` | `0\|1` | `/out/shutters` | Enable shutter mode (disables term) |
 | `revers` | `0\|1` | `/out/revers` | Invert relay logic (GPIO14/16) |
-| `term` | `0\|1` | `/out/term` | Enable thermal protection (disables shutters) |
+| `term` | `0-3` | `/out/term` | Enable thermal protection (disables shutters) 1=DS18B20,2=DHT,3=NTC |
+| `min` | `0-99` | `/out/min` | Antifreeze setpoint °C (default 11) |
+| `max` | `0-99` | `/out/max` | Overheat setpoint °C (default 33) |
 | `count` | `0\|1` | `/out/count` | Enable pulse counting on GPIO0/2 |
 | `gap` | `0-255` | `/out/gap` | Sensor interval multiplier |
 | `sensor` | `0\|1` | `/out/sensor` | Enable analog A0 periodic publish |
+| `pid_mode` | `0-5` | `/out/pid_mode` | Enable PID control (0=off, 1=DS18, 2=DHT, 3=NTC, 4=Analog, 5=MQTT) |
+| `pid_rev` | `0\|1` | `/out/pid_rev` | Invert PID acting |
+| `pid_ku` | `1-255` | `/out/pid_ku` | Set ultimate gain ku/10 |
+| `pid_tu` | `0-255` | `/out/pid_tu` | Set ultimate period (sec) |
+| `pid_set` | `-99..111` | `/out/pid_set` | Set target temperature |
+| `pid_input` | `-255..255` | `/out/pid_input` | Set external MQTT source |
 | `value0-3` | unsigned long | `/out/value0-3` | Set pulse counters |
 | `pwm12/13` | `0-255` | `/out/pwm12/13` | Set PWM target |
 | `rele14/16` | `0/1/ON/OFF` | `/out/rele14/16` | Set relay (true/false/ON/OFF) |
@@ -283,6 +349,7 @@ Physical buttons cannot be triggered via MQTT.
 | `/out/hum4` | % | DHT humidity (periodic) |
 | `/out/an0` | 0-1023 | Analog A0 (periodic) |
 | `/out/pwm12,13` | 0-255 | On PWM change |
+| `/out/pid_out` | float | On PID calculation |
 | `/out/rele14,16` | `0\|1` | On relay change |
 | `/out/somfy11` | 0-255 | On Somfy target change |
 | `/out/shut15` | 0-255 | On shutter target change |
@@ -332,7 +399,20 @@ Analog A0 --> analogRead() x10 avg --> an (0-1023)
 --> MQTT /out/an0
      |
      +--> Read every (1700*(gap+1)) ms if sensor=1
+
+NTC on A0 (when an_ntc=1) --> same analog path
+     |--> temp_ntc = 25.0 + (512.0 - an) * 0.085
+     |--> MQTT /out/temp_ntc
+     |
+     +--> Read every (1700*(gap+1)) ms if sensor=1 and ntc=1
 ```
+
+**Sensor Simulation Override:**
+When simulation values are set via MQTT (`_tmp4`, `_hum4`, `_temp5`):
+- `my_dht()` uses simulated `tmp`/`hum` instead of reading DHT22 hardware
+- `my_temp()` uses simulated `temp` instead of reading DS18B20
+- Periodic publishing reports the simulated values
+- Simulation persists until reboot or new simulation value received
 
 ### 8.2 Button Processing Flow
 
@@ -410,19 +490,39 @@ my_rele(): if revers=0 > digitalWrite(pin, rele)
 ```
 **Note:** `ee_wr()` only writes when value changes, reducing EEPROM wear.
 
+**PID Control (pid > 0):**
+```
+Input (DS18/DHT/NTC/Analog/MQTT) -> Error = Setpoint - Input
+        |
+        v
+PID calculation: Output = Kp*error + Ki*integral + Kd*derivative
+        |
+        v
+D6 (PWM): Analog output (0-255) based on PID output
+D7 (PWM): Binary analog output (0 or 255) based on PID output sign (Dead-band: 10s)
+        |
+        v
+MQTT publish /out/pid_out
+```
+**Timing:** Calculation every 1.1s * (gap+1).
+
 **Thermal Protection (Term=1, Shutters=0):**
 ```
 Every 80s > my_term()
         |
-        +-- DS18B20 temp < 7degC  > rele[14]=1 (heating ON)
-        +-- DS18B20 temp > 10degC > rele[14]=0 (heating OFF)
-        +-- DS18B20 temp > 33degC > rele[16]=1 (cooling ON)
-        +-- DS18B20 temp < 30degC > rele[16]=0 (cooling OFF)
+        +-- term=1: DS18B20 temp (GPIO5)
+        +-- term=2: DHT temp (GPIO4)
+        +-- term=3: NTC temp (A0)
+        |
+        +-- curr_temp < temp_min  > rele[14]=1 (heating ON)
+        +-- curr_temp > temp_min  > rele[14]=0 (heating OFF)
+        +-- curr_temp > temp_max  > rele[16]=1 (cooling ON)
+        +-- curr_temp < temp_max  > rele[16]=0 (cooling OFF)
         |
         v
 EEPROM persist + MQTT publish /out/rele14, /out/rele16
 ```
-**Note:** Uses DS18B20 (GPIO5) temperature only, not DHT22.
+**Note:** Temperature source selected by `term` value: 1=DS18B20, 2=DHT22, 3=NTC resistor. Default setpoints: `temp_min=11°C` (antifreeze), `temp_max=33°C` (overheat). Configurable via `/in/min` and `/in/max`.
 
 ---
 
@@ -456,13 +556,14 @@ EEPROM persist + MQTT publish /out/rele14, /out/rele16
 |----------|---------|----------|
 | `my_temp()` | Read DS18B20, publish /out/temp5 | 7700*(gap+1) ms |
 | `my_dht()` | Read DHT22, publish /out/temp4, /out/hum4 | 6600*(gap+1) ms |
-| `my_analog()` | Read A0 (avg 10), publish /out/an0 | 1700*(gap+1) ms |
+| `my_analog()` | Read A0 (avg 10), publish /out/an0; if ntc=1: temp_ntc = 25.0 + (512.0 - an) * 0.085, publish /out/temp_ntc | 1700*(gap+1) ms |
 
 ### 9.4 Output Control
 
 | Function | Purpose | Timing |
 |----------|---------|--------|
 | `my_pwm()` | Smooth PWM fade (step +-1 every 9ms) | 9ms step |
+| `my_pid()` | PID temperature control for PWM/Relay | 1111*(gap+1) ms |
 | `my_somfy()` | Somfy RTS state machine | 1000ms step, 200/400ms stop |
 | `my_shutters()` | Shutter position control (1s steps) | 1000ms step, 500ms gap |
 | `my_rele(pin)` | Apply relay state with revers logic | Called every loop |
@@ -638,15 +739,22 @@ timestamps). Checks in `my_reset()` every loop.
 | **DHT Read** | `period=1`, wait | `/out/temp4`, `/out/hum4` periodic |
 | **DS18B20** | `period=1`, wait | `/out/temp5` periodic |
 | **Analog** | `sensor=1`, wait | `/out/an0` periodic |
+| **NTC Resistor** | `ntc=1`, `sensor=1`, wait | `/out/temp_ntc` periodic (15-35°C) |
 | **Somfy** | `blinds=1`, `/in/somfy11=50` | D6/D7 pulse sequence for 50s |
 | **Shutters** | `shutters=1`, `/in/shut15=100` | D5/D0 sequence for position 100 |
-| **Thermal** | `term=1`, heat sensor | Relay14 ON <7degC, OFF >10degC |
+| **Thermal (DS18B20)** | `term=1`, heat sensor | Relay14 ON <11°C, OFF >11°C |
+| **Thermal (DHT)** | `term=2`, heat sensor | Relay14 ON <11°C, OFF >11°C |
+| **Thermal (NTC)** | `term=3`, `ntc=1`, heat sensor | Relay14 ON <11°C, OFF >11°C |
+| **Thermal min** | `term=1`, `/in/min=15`, heat to 14°C | Relay14 ON <15°C, OFF >15°C |
+| **Thermal max** | `term=1`, `/in/max=25`, heat to 26°C | Relay16 ON >25°C, OFF <25°C |
 | **Web UI** | Browser to device IP | Full status page loads |
 | **Reset 20s** | Hold D3+D4 20s | Reboots, net_default=1 |
 | **Reset 30s** | Hold D3+D4 30s (from default) | Reboots, net_ap_mode=1 |
 | **MQTT Reboot** | Publish `/in/reboot` | Device restarts |
 | **Memory Low** | Simulate heap <10KB | Auto reset with `/out/reset` |
-| **Sensor Sim** | Publish `/in/_tmp4=25` | `/out/tmp4` = "25", DHT temp overridden |
+| **Sensor Sim (DHT temp)** | Publish `/in/_tmp4=25` | `/out/tmp4` = "25", DHT temp overridden |
+| **Sensor Sim (DHT hum)** | Publish `/in/_hum4=60` | `/out/hum4` = "60", DHT humidity overridden |
+| **Sensor Sim (DS18B20)** | Publish `/in/_temp5=20` | `/out/temp5` = "20", DS18B20 temp overridden |
 | **Relay Persist** | `state=1`, set relay, reboot | Relay state restored on boot |
 | **PWM Persist** | `state=1`, set PWM, reboot | PWM value restored on boot |
 
@@ -681,7 +789,7 @@ timestamps). Checks in `my_reset()` every loop.
 1. **Power** the Wemos D1 mini via USB or 5V to VU pin
 2. **Connect** to WiFi network `hjhome` (pass: `pass1234`) — or configure AP mode
 3. **MQTT Broker** must be at `192.168.0.10` (default) or configure via AP/web
-4. **Discover** device: subscribe to `wemos/out/#` (default name: `wemos`)
+4. **Discover** device: subscribe to `/wemos/out/#` (default name: `wemos`)
 
 ### 15.2 Common Operations
 
@@ -715,7 +823,7 @@ timestamps). Checks in `my_reset()` every loop.
 1. **Power on** device
 2. **Press and hold** both **D3 (Flash)** and **D4** buttons simultaneously
 3. **Hold 20 seconds** -> Resets to default network (connects to `hjhome`)
-4. **Hold 30 seconds** (from default) -> Enables AP mode (`ESP8266_hjhome`)
+4. **Hold 20 seconds** (from default) -> Enables AP mode (`ESP8266_hjhome`)
 
 ---
 
@@ -731,7 +839,7 @@ timestamps). Checks in `my_reset()` every loop.
 | **Non-blocking** | `millis()` scheduling, no `delay()` in loop | Prevents starvation |
 | **Auto-reconnect** | Periodic MQTT/WiFi retry in loop | Survives network outages |
 | **State restore** | `state=1` restores PWM/relay on boot | Power loss recovery |
-| **Thermal protect** | `term=1` auto-controls relays by DS18B20 temp | Hardware safety |
+| **Thermal protect** | `term=1/2/3` auto-controls relays by DS18B20/DHT/NTC temp | Hardware safety |
 | **Dual reset** | 20s/30s button combo (D3+D4) | Field recovery without tools |
 | **Button debounce** | Digital: 10 counts, Analog: 333 counts | Filters noise |
 | **PWM smooth fade** | 9ms step (2.3s full range) | No visible flicker |
@@ -751,7 +859,7 @@ timestamps). Checks in `my_reset()` every loop.
 - [ ] Document device name, location, mode config per install
 - [ ] Set `gap` for desired sensor interval (0=fast, 255=slow)
 - [ ] Enable `state=1` for output persistence across power loss
-- [ ] Enable `term=1` for unattended freeze/overheat protection
+- [ ] Enable `term=1/2/3` for unattended freeze/overheat protection (select sensor)
 
 ### 16.3 Monitoring & Maintenance
 
@@ -817,7 +925,7 @@ timestamps). Checks in `my_reset()` every loop.
 | DHT timeout | Fixed at 15 cycles | Constructor param, not adjustable |
 | Relay persist bug | `my_rele` only writes on true | `ee_wr` called only when rele[i]==true |
 | Analog button mode | Only when `sensor=0` | Shared A0 pin |
-| Thermal sensor | DS18B20 only | DHT22 temp ignored for protection |
+| Thermal sensor | term=1/2/3 selects source | DS18B20/DHT/NTC selectable via term value |
 
 ---
 
@@ -844,6 +952,10 @@ timestamps). Checks in `my_reset()` every loop.
 | 22-jan-19 | | Revers, shutter divider |
 | 23-jan-19 | | Shutter 1s step fix |
 | 25-jul-26 | **23-jul-26** | **Add AP mode** |
+| 25-jul-26 | | Add AP mode |
+| 29-jul-26 | | Add temp, tmp, hum simulation |
+| 13-aug-26 | | Add min, max temp, add NTC Resistor |
+| 30-aug-26 | | add pid controller |
 
 ---
 

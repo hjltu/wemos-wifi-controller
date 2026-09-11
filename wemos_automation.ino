@@ -120,7 +120,6 @@ int term,temp,hum,tmp,an,sn,bcount[18],pin;
 int temp_max=33, temp_min=11, temp_ntc=22;
 int pid, pid_ku, pid_tu, pid_integral, pid_last_error;
 int RELE_DEAD_BAND = 9999, pid_last_switch, pid_input=22;
-int PID_INTEGRAL_MIN=-255, PID_INTEGRAL_MAX=255;
 int8_t pid_set;
 float pid_ku_float;
 
@@ -549,21 +548,22 @@ client.println(F("/in/command)<br>"));
 client.println(F("echo, test, ip, mac, srv, info, reboot, memory, millis"));
 client.println(F("<br>name, ssid, pass, mqtt, default, apmode"));
 client.println(F("<details><summary>Commands descriptions:</summary>"));
-client.println(F("<br>current: ip,mac - IP,MAC address, mqtt - IP for MQTT server"));
+client.println(F("<br>* an indication that a reboot is required"));
+client.println(F("<br>current: ip,mac - IP,MAC address, srv - IP for MQTT server"));
 client.println(F("<br>reboot - reboot esp8266, memory - free RAM, millis - milliseconds"));
-client.println(F("<br>name - new name, ssid - new ssid, pass - new pass, mqtt - IP for server"));
+client.println(F("<br>name* - new name, ssid* - new ssid, pass* - new pass, mqtt* - IP for server"));
 client.println(F("<br>state - outputs rele14,16,pwm12,13 save after power off 0/1"));
 client.println(F("<br>http - set web server | 0/1"));
-client.println(F("<br>blinds - set out12, out13 for blinds(somfy) | 0/1"));
-client.println(F("<br>buttons - set out12, out13 for buttons | 0/1"));
-client.println(F("<br>shutters - set out14, out16 for shutters | 0/1"));
-client.println(F("<br>revers - set reversed output for out14, out16 | 0/1"));
-client.println(F("<br>term - set antifreezing function: min&#x2103 for rele14"));
-client.println(F("<br>  term - set overheating function: max&#x2103 for rele16 | 0-3"));
+client.println(F("<br>blinds* - set out12, out13 for blinds(somfy) | 0/1"));
+client.println(F("<br>buttons* - set out12, out13 for buttons | 0/1"));
+client.println(F("<br>shutters* - set out14, out16 for shutters | 0/1"));
+client.println(F("<br>revers* - set reversed output for out14, out16 | 0/1"));
+client.println(F("<br>term* - set antifreezing function: min&#x2103 for rele14 | 0-3"));
+client.println(F("<br>  term - set overheating function: max&#x2103 for rele16"));
 client.println(F("<br>  term - set 0 - disable, 1 - DS18b20, 2 - DHT, 3 - NTC"));
 client.println(F("<br>min - term setpoint for antifreezing | 0-99"));
 client.println(F("<br>max - term setpoint overheating | 0-99"));
-client.println(F("<br>pid_mode - set pid function: for pwm12,13 | 0-5"));
+client.println(F("<br>pid_mode* - set pid function: for pwm12,13 | 0-5"));
 client.println(F("<br>  pid_mode - output: pwm12 - 0-255, pwm13 - discrete (on/off)"));
 client.println(F("<br>  pid_mode - 0 - disable, 1 - DS18b20, 2 -DHT, 3 - NTC, 4 - analog, 5 - MQTT"));
 client.println(F("<br>  pid_rev - set pid reverse acting | 0/1"));
@@ -577,10 +577,10 @@ client.println(F("<br>gap - set interval 6(2)sec-30(7)min for sensors temp,tmp,h
 client.println(F("<br>period - set send temp5,temp4,hum4,an0 stat periodicaly | 0/1"));
 client.println(F("<br>sensor - set analog input an0(A0)  | 0/1"));
 client.println(F("<br>ntc - set A0 as NTC Resistor 10k, Pull-down 15-35&#x2103  | 0/1"));
-client.println(F("<br>default - set default network settings | 0/1"));
+client.println(F("<br>default* - set default network settings | 0/1"));
 client.println(F("<br>  press bt0 and bt2 for 20 sec to reset(default)"));
 client.println(F("<br>  press bt0 and bt2 for 20 sec to reset(default AP mode)"));
-client.println(F("<br>apmode - set default Access Point Mode 0/1"));
+client.println(F("<br>apmode* - set default Access Point Mode 0/1"));
 client.println(F("<br>_temp5 - simulate ds18b20 sensor | -100 - 100"));
 client.println(F("<br>_tmp4, _hum4 - simulate dht22 sensor | -100 - 100"));
 client.println(F("</details>"));
@@ -1126,7 +1126,7 @@ void callback(const MQTT::Publish& pub)
             ee_wr(103,0);   // blinds
             ee_wr(106,0);   // buttons
         }
-        str_topic = String("/" + str_name + "/out/pid");
+        str_topic = String("/" + str_name + "/out/pid_mode");
         str_payload = String(EEPROM.read(116));
         my_print();
     }
@@ -1385,6 +1385,9 @@ void my_pid()
 // input: pid, pid_tu, pid_set, pid_input, pid_integral, pid_last_error
 // out: PWM D12, pwm[12] 0-255 and relay D14 pwm[14] 0,255
 {
+int PID_INTEGRAL_MIN=-99, PID_INTEGRAL_MAX=99;
+int PID_PWM_MIN=0, PID_PWM_MAX=255;
+
     float input = 0;
     if(pid==1)
         input = temp;   // DS18B20
@@ -1417,16 +1420,16 @@ void my_pid()
     if(millis() > pid_last_switch + RELE_DEAD_BAND)
     {
         if(output > 0)
-            pwm[13] = 255;
+            pwm[13] = PID_PWM_MAX;
         else
-            pwm[13] = 0;
+            pwm[13] = PID_PWM_MIN;
         pid_last_switch = millis();
         str_topic = String("/" + str_name + "/out/pwm" + 13);
         str_payload = String(pwm[13]);
         my_print();
     }
 
-    pwm[12] = constrain((int)output, 0, 255);
+    pwm[12] = constrain((int)output, PID_PWM_MIN, PID_PWM_MAX);
     str_topic = String("/" + str_name + "/out/pwm" + 12);
     str_payload = String(pwm[12]);
     my_print();

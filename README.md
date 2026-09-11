@@ -65,8 +65,10 @@ mosquitto_sub -t 'livingroom/out/#' -v
 | D5  | 14   | Relay 1          | -           | -            | Shutter UP    |
 | D0  | 16   | Relay 2          | -           | -            | Shutter DOWN  |
 | A0  | -    | Analog 0-1023    | -           | Button*      | -             |
+| A0  | -    | NTC 10k (term=3) | -           | -            | -             |
 
 *Analog button only when `sensor=0`
+*NTC: 10k thermistor + pull-down, ~15-35°C range
 
 ---
 
@@ -74,9 +76,9 @@ mosquitto_sub -t 'livingroom/out/#' -v
 
 | Group | Modes | Description |
 |-------|-------|-------------|
-| **GPIO12/13** | `blinds` OR `buttons` | Somfy blinds OR 2 extra buttons |
-| **GPIO14/16** | `shutters` OR `term` | Shutter motor OR Thermal protection |
-| **Sensors** | `period` + `sensor` | Periodic temp/hum + analog publish |
+| **GPIO12/13** | `blinds` OR `buttons` OR `pid` | Somfy blinds OR 2 extra buttons OR PID control |
+| **GPIO14/16** | `shutters` OR `term` | Shutter motor OR Thermal protection (term=1/2/3) |
+| **Sensors** | `period` + `sensor` + `ntc` | Periodic temp/hum + analog + NTC |
 | **Network** | `default` OR `apmode` | Use saved WiFi OR create AP |
 
 **Enable via MQTT:**
@@ -84,7 +86,9 @@ mosquitto_sub -t 'livingroom/out/#' -v
 mosquitto_pub -t 'livingroom/in/blinds' -m '1'    # Somfy mode
 mosquitto_pub -t 'livingroom/in/buttons' -m '1'   # Button mode
 mosquitto_pub -t 'livingroom/in/shutters' -m '1'  # Shutter mode
-mosquitto_pub -t 'livingroom/in/term' -m '1'      # Thermal protect
+mosquitto_pub -t 'livingroom/in/term' -m '1'      # Thermal protect: DS18B20
+mosquitto_pub -t 'livingroom/in/term' -m '2'      # Thermal protect: DHT22
+mosquitto_pub -t 'livingroom/in/term' -m '3'      # Thermal protect: NTC (requires ntc=1)
 ```
 
 ---
@@ -114,10 +118,19 @@ mosquitto_pub -t 'livingroom/in/term' -m '1'      # Thermal protect
 | `buttons` | `0` or `1` | Enable buttons (D6/D7) |
 | `shutters` | `0` or `1` | Enable shutters (D5/D0) |
 | `revers` | `0` or `1` | Invert relay logic |
-| `term` | `0` or `1` | Thermal protection |
+| `term` | `0-3` | Thermal protection (1=DS18B20, 2=DHT, 3=NTC) |
+| `min` | `0-99` | Antifreeze setpoint (default 11) |
+| `max` | `0-99` | Overheat setpoint (default 33) |
+| `ntc` | `0` or `1` | Enable NTC 10k on A0 |
 | `count` | `0` or `1` | Pulse counter (D3/D4) |
 | `gap` | `0-255` | Sensor interval multiplier |
 | `sensor` | `0` or `1` | Publish analog A0 |
+| `pid_mode` | `0-5` | Enable PID (0=off, 1=DS18, 2=DHT, 3=NTC, 4=An, 5=MQTT) |
+| `pid_rev` | `0` or `1` | Invert PID acting |
+| `pid_ku` | `1-255` | Ultimate gain (ku/10) |
+| `pid_tu` | `0-255` | Ultimate period (sec) |
+| `pid_set` | `-99..111` | Target temperature |
+| `pid_input` | `-255..255` | External MQTT setpoint |
 | `value0-3` | number | Set pulse counters |
 | `pwm12` | `0-255` | D6 brightness |
 | `pwm13` | `0-255` | D7 brightness |
@@ -139,8 +152,10 @@ mosquitto_pub -t 'livingroom/in/term' -m '1'      # Thermal protect
 | `temp4` | degC | DHT temperature |
 | `hum4` | % | DHT humidity |
 | `temp5` | degC | DS18B20 temperature |
+| `temp_ntc` | degC | NTC temperature (when ntc=1) |
 | `an0` | `0-1023` | Analog input |
 | `pwm12,13` | `0-255` | PWM changed |
+| `pid_out` | float | PID calculation result |
 | `rele14,16` | `0/1` | Relay changed |
 | `somfy11` | `0-255` | Blind target changed |
 | `shut15` | `0-255` | Shutter target changed |
@@ -216,14 +231,18 @@ mosquitto_sub -t 'livingroom/out/hum4' -v   # DHT humidity
 mosquitto_sub -t 'livingroom/out/temp5' -v  # DS18B20
 ```
 
-### 6. Thermal Protection (Requires `term=1`, `shutters=0`)
+### 6. Thermal Protection (Requires `term=1/2/3`, `shutters=0`)
 ```bash
 # Enable anti-freeze / overheat
-mosquitto_pub -t 'livingroom/in/term' -m '1'
+mosquitto_pub -t 'livingroom/in/term' -m '1'   # DS18B20 (GPIO5)
+mosquitto_pub -t 'livingroom/in/term' -m '2'   # DHT22 (GPIO4)
+mosquitto_pub -t 'livingroom/in/term' -m '3'   # NTC 10k (A0, requires ntc=1)
 
-# Relay 1 (D5): Heating ON <7C, OFF >10C
-# Relay 2 (D0): Cooling ON >33C, OFF <30C
-# Uses DS18B20 sensor only
+# Relay 1 (D5): Heating ON < temp_min (default 11C), OFF > temp_min
+# Relay 2 (D0): Cooling ON > temp_max (default 33C), OFF < temp_max
+# Setpoints configurable:
+mosquitto_pub -t 'livingroom/in/min' -m '11'   # Antifreeze setpoint
+mosquitto_pub -t 'livingroom/in/max' -m '33'   # Overheat setpoint
 ```
 
 ### 7. Pulse Counting (Requires `count=1`)
@@ -248,6 +267,23 @@ mosquitto_pub -t 'livingroom/in/value0' -m '1000'
 | A0* | `/out/bt17 = 1` | `/out/bt17 = 2` |
 
 *Only in `buttons=1` or `sensor=0` mode
+
+### 9. PID Temperature Control (Requires `pid_mode=1..5`)
+```bash
+# Enable PID using DS18B20 sensor (GPIO5)
+mosquitto_pub -t 'livingroom/in/pid_mode' -m '1'
+
+# Set target temperature to 22C
+mosquitto_pub -t 'livingroom/in/pid_set' -m '22'
+
+# Tune PID (Example: ku=15, tu=100s)
+mosquitto_pub -t 'livingroom/in/pid_ku' -m '15'
+mosquitto_pub -t 'livingroom/in/pid_tu' -m '100'
+
+# Monitor output
+mosquitto_sub -t 'livingroom/out/pid_out' -v
+```
+*Controls D6 (Analog PWM 0-255) and D7 (Binary PWM 0/255 with 10s dead-band) based on temperature error.*
 
 ---
 
@@ -287,6 +323,21 @@ mosquitto_pub -t 'livingroom/in/_hum4' -m '60'
 mosquitto_pub -t 'livingroom/in/_temp5' -m '22'
 ```
 *Published back on `/out/tmp4`, `/out/hum4`, `/out/temp5`*
+
+## NTC Resistor (10k, A0)
+
+10k NTC thermistor with pull-down resistor on A0:
+```bash
+# Enable NTC mode
+mosquitto_pub -t 'livingroom/in/ntc' -m '1'
+
+# Use with thermal protection (term=3)
+mosquitto_pub -t 'livingroom/in/term' -m '3'
+
+# Read temperature (when sensor=1)
+mosquitto_sub -t 'livingroom/out/temp_ntc' -v
+```
+Range: ~15-35°C. Formula: `25.0 + (512.0 - an) * 0.085`
 
 ---
 
