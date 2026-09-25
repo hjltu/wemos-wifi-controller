@@ -43,6 +43,7 @@
 // 13aug26 add min,max temp, add NTC Resistor
 // 29aug26 change eeprom write
 // 30aug26 add pid controller
+// 25sep26 add http API
 
 
 // D0   GPIO16
@@ -73,7 +74,7 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 
-const char* vers = "30-Aug-26";
+const char* vers = "25-Sep-26";
 
 // default settings
 String str_name = "wemos";
@@ -113,7 +114,7 @@ const int BUFSIZE = 20;
 
 bool bt[18],rele[18],net_default,http,count;
 bool state,period,blinds,shutters,buttons,sensor;
-bool revers,net_ap_mode,an_ntc,pid_rev;
+bool revers,an_ntc,pid_rev;
 byte ac_pwm[18],pwm[18],gap,my_mqtt[4];
 byte somfy,ac_somfy,shut,ac_shut;
 int term,temp,hum,tmp,an,sn,bcount[18],pin;
@@ -122,6 +123,7 @@ int pid, pid_ku, pid_tu, pid_integral, pid_last_error;
 int RELE_DEAD_BAND = 9999, pid_last_switch, pid_input=22;
 int8_t pid_set;
 float pid_ku_float;
+int MANUAL_RESET_TIMER = 19999;
 
 unsigned long lcount[18],rcount[18];
 unsigned long stop_count,scount,shcount;
@@ -138,7 +140,7 @@ void setup()
     my_eeprom_states();
     my_pin_mode();
     Serial.println(F("Pin mode OK"));
-    if(net_default==false && net_ap_mode==false)
+    if(net_default==0)
     {
         str_name = my_str_read(str_name,80);
         delay(10);
@@ -153,14 +155,14 @@ void setup()
         Serial.printf("Set Saved Network: Name: %s, SSID: %s, PASS: %s, MQTT: %s\n",
             str_name, str_ssid, str_pass.c_str(), mqtt_server.toString().c_str());
     }
-    if(net_default==true)
+    if(net_default==1)
     {
         mqtt_server = mqtt_default_server;
         mclient.set_server(mqtt_server);
         Serial.printf("Set Default Network: Name: %s, SSID: %s, PASS: %s, MQTT: %s\n",
             str_name, str_ssid, str_pass.c_str(), mqtt_server.toString().c_str());
     }
-    if(net_ap_mode==true)
+    if(net_default==2 || net_default > 2)
     {
         str_ssid = ap_ssid;
         str_pass = ap_pass;
@@ -213,8 +215,6 @@ void setup()
     Serial.println(an_ntc);
     Serial.print("default: ");
     Serial.println(net_default);
-    Serial.print("apmode: ");
-    Serial.println(net_ap_mode);
     sensors.begin();            // ds18b20
     dht.begin();                // DHT22
     delay(10);
@@ -243,7 +243,6 @@ void my_eeprom_states()
     net_default=EEPROM.read(109);
     shutters=EEPROM.read(110);
     revers=EEPROM.read(111);
-    net_ap_mode=EEPROM.read(112);
     temp_min=EEPROM.read(113);
     temp_max=EEPROM.read(114);
     an_ntc=EEPROM.read(115);
@@ -421,7 +420,7 @@ void my_connect()
 {
 
     // create AP
-    if (net_ap_mode==true)
+    if (net_default==2)
     {
         if (WiFi.getMode() != WIFI_AP)
             Serial.println("Access Point Hotspot: FAILED TO START");
@@ -440,7 +439,7 @@ void my_connect()
     }
 
     // connect to STA
-    if (WiFi.status() != WL_CONNECTED && net_ap_mode==false)
+    if (WiFi.status() != WL_CONNECTED && net_default <= 1)
     {
         Serial.println(F("Wifi connecting... "));
         int ssid_len=str_ssid.length()+1;
@@ -509,6 +508,41 @@ void my_web()
 //      delay(1);
     String req = client.readStringUntil('\n'); //r
 //  Serial.println(req);
+
+// TODO test web API
+String topicValue = "";
+String payloadValue = "";
+Serial.println("Raw Request: " + req);
+
+// Look for the starting positions of our parameter names
+int topPos = req.indexOf("topic_param=");
+int payPos = req.indexOf("payload_param=");
+
+// Only parse if both parameters exist in the request URL
+if (topPos != -1 && payPos != -1) {
+
+  // 1. Extract Command Parameter
+  // End at the '&' character that separates the two parameters
+  int textStart = topPos + 12;
+  int textEnd = req.indexOf('&', textStart);
+  String rawText = req.substring(textStart, textEnd);
+  topicValue = "/" + str_name + "/in/" + rawText;
+
+  // 2. Extract Payload Parameter
+  // End at the next space character ' ' before "HTTP/1.1"
+  textStart = payPos + 14;
+  textEnd = req.indexOf(' ', textStart);
+  rawText = req.substring(textStart, textEnd);
+  // Clean up URL formatting (browsers turn spaces into '+')
+  rawText.replace("+", " ");
+  payloadValue = rawText;
+
+  // Print results to Serial Monitor
+  Serial.print("Web Parsed Topic: "); Serial.println(topicValue);
+  Serial.print("Web Parsed Payload: "); Serial.println(payloadValue);
+  parse_incoming_command(topicValue,payloadValue);
+}
+
     client.flush();
 //  Serial.println(req.length());
 
@@ -546,45 +580,59 @@ client.print(F("<br>Commands: (/"));
 client.print(str_name);
 client.println(F("/in/command)<br>"));
 client.println(F("echo, test, ip, mac, srv, info, reboot, memory, millis"));
-client.println(F("<br>name, ssid, pass, mqtt, default, apmode"));
+client.println(F("<br>name, ssid, pass, mqtt, default"));
 client.println(F("<details><summary>Commands descriptions:</summary>"));
 client.println(F("<br>* an indication that a reboot is required"));
 client.println(F("<br>current: ip,mac - IP,MAC address, srv - IP for MQTT server"));
 client.println(F("<br>reboot - reboot esp8266, memory - free RAM, millis - milliseconds"));
 client.println(F("<br>name* - new name, ssid* - new ssid, pass* - new pass, mqtt* - IP for server"));
 client.println(F("<br>state - outputs rele14,16,pwm12,13 save after power off 0/1"));
-client.println(F("<br>http - set web server | 0/1"));
+client.println(F("<br>http - set web server and web API | 0/1"));
+client.println(F("..http GET: /?topic_param=command&payload_param=payload "));
 client.println(F("<br>blinds* - set out12, out13 for blinds(somfy) | 0/1"));
 client.println(F("<br>buttons* - set out12, out13 for buttons | 0/1"));
 client.println(F("<br>shutters* - set out14, out16 for shutters | 0/1"));
 client.println(F("<br>revers* - set reversed output for out14, out16 | 0/1"));
 client.println(F("<br>term* - set antifreezing function: min&#x2103 for rele14 | 0-3"));
-client.println(F("<br>  term - set overheating function: max&#x2103 for rele16"));
-client.println(F("<br>  term - set 0 - disable, 1 - DS18b20, 2 - DHT, 3 - NTC"));
+client.println(F("<br>..term - set overheating function: max&#x2103 for rele16"));
+client.println(F("<br>..term: 0 - disable, 1 - DS18b20, 2 - DHT, 3 - NTC"));
 client.println(F("<br>min - term setpoint for antifreezing | 0-99"));
 client.println(F("<br>max - term setpoint overheating | 0-99"));
 client.println(F("<br>pid_mode* - set pid function: for pwm12,13 | 0-5"));
-client.println(F("<br>  pid_mode - output: pwm12 - 0-255, pwm13 - discrete (on/off)"));
-client.println(F("<br>  pid_mode - 0 - disable, 1 - DS18b20, 2 -DHT, 3 - NTC, 4 - analog, 5 - MQTT"));
-client.println(F("<br>  pid_rev - set pid reverse acting | 0/1"));
-client.println(F("<br>  pid_ku - set pid ultimate gain ku/10 | 1-255"));
-client.println(F("<br>  pid_tu - set pid ultimate period (sec) | 0-255"));
-client.println(F("<br>  pid_set - set pid setpoint | -99-111"));
-client.println(F("<br>  pid_input - set pid MQTT source, default=22 | -255-255"));
+client.println(F("<br>..pid_mode - output: pwm12 - 0-255, pwm13 - discrete (on/off)"));
+client.println(F("<br>..pid_mode: 0 - disable, 1 - DS18b20, 2 -DHT, 3 - NTC, 4 - analog, 5 - MQTT"));
+client.println(F("<br>pid_rev - set pid reverse acting | 0/1"));
+client.println(F("<br>pid_ku - set pid ultimate gain ku/10 | 1-255"));
+client.println(F("<br>pid_tu - set pid ultimate period (sec) | 0-255"));
+client.println(F("<br>pid_set - set pid setpoint | -99-111"));
+client.println(F("<br>pid_input - set pid MQTT source, default=22 | -255-255"));
 client.println(F("<br>count - set counter for in0, in2 | 0/1"));
 client.println(F("<br>value0,1,2,3 - set unsigned long | 0 - 2147483647"));
 client.println(F("<br>gap - set interval 6(2)sec-30(7)min for sensors temp,tmp,hum,(an) | 0 - 255"));
 client.println(F("<br>period - set send temp5,temp4,hum4,an0 stat periodicaly | 0/1"));
 client.println(F("<br>sensor - set analog input an0(A0)  | 0/1"));
 client.println(F("<br>ntc - set A0 as NTC Resistor 10k, Pull-down 15-35&#x2103  | 0/1"));
-client.println(F("<br>default* - set default network settings | 0/1"));
-client.println(F("<br>  press bt0 and bt2 for 20 sec to reset(default)"));
-client.println(F("<br>  press bt0 and bt2 for 20 sec to reset(default AP mode)"));
-client.println(F("<br>apmode* - set default Access Point Mode 0/1"));
-client.println(F("<br>_temp5 - simulate ds18b20 sensor | -100 - 100"));
-client.println(F("<br>_tmp4, _hum4 - simulate dht22 sensor | -100 - 100"));
+client.println(F("<br>default* - set default network settings | 0,1,2"));
+client.println(F("<br>..default: 0 - STA saved network, 1 - STA default network, 2 - AP mode"));
+client.println(F("<br>..press bt0 and bt2 for 20 sec to reset(default STA)"));
+client.println(F("<br>..press bt0 and bt2 for 20 sec to reset(default AP mode)"));
+client.println(F("<br>_temp5 - simulate temperature ds18b20 sensor | -99 - 99"));
+client.println(F("<br>_tmp4 - simulate temperature dht22 sensor | -99 - 99"));
+client.println(F("<br>_hum4 - simulate humidity dht22 sensor | 0 - 100"));
 client.println(F("</details>"));
 //
+// HTML Form setup (submits data back to the Arduino using a GET request)
+client.println("<br><form action='/' method='get'>");
+// Input Field 1: Text
+client.println("<label for='textInput'>Enter Command:</label>");
+client.println("<input type='text' id='textInput' name='topic_param'><br>");
+// Input Field 2: Text
+client.println("<label for='textInput'>Enter Payload:</label>");
+client.println("<input type='text' id='textInput' name='payload_param'><br>");
+// Submit Button
+client.println("<input type='submit' value='Submit Data'>");
+client.println("</form>");
+
 client.print(F("<br>topic: "));
 client.print(str_topic);
 client.print(F("<br>payload: "));
@@ -818,12 +866,8 @@ client.print(F("/in/ntc</th><th>0,1</th><th>"));
 client.print(an_ntc);
 client.println(F("</th></tr><tr><th>EEPROM</th><th>default</th><th>/"));
 client.print(str_name);
-client.print(F("/in/default</th><th>0,1</th><th>"));
+client.print(F("/in/default</th><th>0,1,2</th><th>"));
 client.print(net_default);
-client.println(F("</th></tr><tr><th>EEPROM</th><th>apmode</th><th>/"));
-client.print(str_name);
-client.print(F("/in/apmode</th><th>0,1</th><th>"));
-client.print(net_ap_mode);
 client.println(F("</th></tr></table><hr>"));
 
 client.print(F("<center><a href='https://github.com/hjltu/hjmqtt'>"));
@@ -854,7 +898,11 @@ void callback(const MQTT::Publish& pub)
 {
     String inc_topic = pub.topic();
     String inc_payload = pub.payload_string();
-    
+    parse_incoming_command(inc_topic,inc_payload);
+}
+
+void parse_incoming_command(const String& inc_topic, const String& inc_payload)
+{
     if(inc_topic.indexOf("/in")>0)
     {
     Serial.print(F("incoming topic: "));
@@ -872,10 +920,6 @@ void callback(const MQTT::Publish& pub)
     {
         str_topic = String("/" + str_name + "/out/ip");
         str_payload = str_ip;
-        //if (net_ap_mode==true)
-        //    str_payload = WiFi.softAPIP().toString();
-        //if (net_ap_mode==false)
-        //    str_payload = WiFi.localIP().toString();
         my_print();
     }
     if(inc_topic.indexOf("/mac")>0)
@@ -888,14 +932,9 @@ void callback(const MQTT::Publish& pub)
     {
         str_topic = String("/" + str_name + "/out/srv");
         str_payload = mqtt_server.toString();
-            //str_payload = String(my_mqtt[0],DEC)+
-            //"."+String(my_mqtt[1],DEC)+
-            //"."+String(my_mqtt[2],DEC)+
-            //"."+String(my_mqtt[3],DEC);
         my_print();
     }
 
-    // TODO
     if(inc_topic.indexOf("in/info")>0)
     {
         str_topic = String("/" + str_name + "/out/info");
@@ -967,21 +1006,9 @@ void callback(const MQTT::Publish& pub)
         my_print();
     }
 
-    if(inc_topic.indexOf("/apmode")>0)
-    {
-        if(inc_payload=="1" || inc_payload=="0")
-        {
-            net_ap_mode=inc_payload.toInt();
-            ee_wr(112,net_ap_mode);
-        }
-        str_topic = String("/" + str_name + "/out/apmode");
-        str_payload = String(net_ap_mode);
-        my_print();
-    }
-
     if(inc_topic.indexOf("/default")>0)
     {
-        if(inc_payload=="1" || inc_payload=="0")
+        if(inc_payload.toInt() >=0 && inc_payload.toInt() <= 2)
         {
             net_default=inc_payload.toInt();
             ee_wr(109,net_default);
@@ -1246,7 +1273,7 @@ void callback(const MQTT::Publish& pub)
         }
         if(inc_topic.indexOf("/_tmp" + String(i))>0 && i==4)
         {
-            if((inc_payload.toInt() > -99 && inc_payload.toInt() < 99))
+            if((inc_payload.toInt() >= -99 && inc_payload.toInt() <= 99))
                 tmp=inc_payload.toInt();
             str_topic = String("/" + str_name + "/out/tmp" + i);
             str_payload = String(tmp);
@@ -1262,7 +1289,7 @@ void callback(const MQTT::Publish& pub)
         }
         if(inc_topic.indexOf("/_temp" + String(i))>0 && i==5)
         {
-            if((inc_payload.toInt() > -99 && inc_payload.toInt() < 99))
+            if((inc_payload.toInt() >= -99 && inc_payload.toInt() <= 99))
                 temp=inc_payload.toInt();
             str_topic = String("/" + str_name + "/out/temp" + i);
             str_payload = String(temp);
@@ -1712,7 +1739,6 @@ String my_str_read(String name, int shift)
         return(name);
 }
 
-// TODO test eeprom write/read
 void my_str_write(String name, int shift)
 {
     for (unsigned int i = 0; i < name.length(); i++)
@@ -1794,48 +1820,36 @@ void my_memory()
 void my_reset()
 // to reset press bt0 and bt2 (D3+D4+G) for 20sec
 {
-    if(rcount[0]>0 && rcount[0]<millis()-19999)
-        if(rcount[2]>0 && rcount[2]<millis()-19999)
-            if(millis()>19999 && bt[0]==true && bt[2]==true)
+    if(rcount[0]>0 && rcount[0] < millis() - MANUAL_RESET_TIMER)
+        if(rcount[2]>0 && rcount[2] < millis() - MANUAL_RESET_TIMER)
+            if(millis()>MANUAL_RESET_TIMER && bt[0]==true && bt[2]==true)
             {
                 rcount[0]=0;
                 rcount[2]=0;
-                // reset to default
-                if (net_default==false)
-                {
-                    net_default=true;
-                    ee_wr(109,net_default);
-                    net_ap_mode=false;
-                    ee_wr(112,net_ap_mode);
-                    my_reset_print();
-                }
-                // reset from AP to default
-                if (net_default==true && net_ap_mode==true)
-                {
-                    net_default=true;
-                    ee_wr(109,net_default);
-                    net_ap_mode=false;
-                    ee_wr(112,net_ap_mode);
-                    my_reset_print();
-                }
-                // reset from default to AP
-                if (net_default==true && net_ap_mode==false)
-                {
-                    net_ap_mode=true;
-                    ee_wr(112,net_ap_mode);
-                    my_reset_print();
-                }
+
+                // reset to saved STA
+                if (net_default==2)
+                    net_default=0;
+
+                // reset to default STA
+                else if (net_default==0)
+                    net_default=1;
+
+                // reset to AP
+                else
+                    net_default=2;
+
+                ee_wr(109,net_default);
+                my_reset_print();
             }
 }
 
 void my_reset_print()
 {
-    Serial.printf("reset: default: %d, apmode: %d\n",
-    net_default, net_ap_mode);
+    Serial.printf("reset: default: %d\n", net_default);
     str_topic = String("/" + str_name + "/out/reset");
     str_payload = "Reset: default=";
     str_payload += String(net_default);
-    str_payload += ", apmode=";
     my_print();
     ESP.restart();
 }
