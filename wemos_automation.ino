@@ -518,7 +518,8 @@ int topPos = req.indexOf("topic_param=");
 int payPos = req.indexOf("payload_param=");
 
 // Only parse if both parameters exist in the request URL
-if (topPos != -1 && payPos != -1) {
+if (topPos != -1 && payPos != -1)
+{
 
   // 1. Extract Command Parameter
   // End at the '&' character that separates the two parameters
@@ -536,6 +537,18 @@ if (topPos != -1 && payPos != -1) {
   rawText.replace("+", " ");
   payloadValue = rawText;
 
+  // Prevent reboot loop TODO test reboot
+  if(topicValue.indexOf("/reboot")>0)
+  {
+    client.println(F("HTTP/1.1 303 See Other Location: /"));
+  //client.println("Connection: close");
+  //client.println();
+    delay(99);
+    client.flush();
+    delay(99);
+    client.stop();
+    delay(999);
+  }
   // Print results to Serial Monitor
   Serial.print("Web Parsed Topic: "); Serial.println(topicValue);
   Serial.print("Web Parsed Payload: "); Serial.println(payloadValue);
@@ -559,6 +572,8 @@ client.println(F("</head><body bgcolor='#c2d4dd'><center><h2>ESP8266 MQTT client
 client.println(F("<input type='button' onclick='reload()' value=' Reload &#x21bb; '>"));
 client.println(F("</h2></center>"));
 client.println(F("<script>function reload() {location.href='/';}</script>"));
+//client.println(F("<script>window.onload = function()"));
+//client.println(F("{window.history.replaceState({}, document.title, '/');};</script>"));
 client.println(F("<hr><table><tr><th>Name:</th><th>"));
 client.print(str_name);
 client.println(F("</th></tr><th>IP address:</th><th>"));
