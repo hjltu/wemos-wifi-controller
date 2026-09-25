@@ -74,7 +74,7 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 
-const char* vers = "25-Sep-26";
+const char* vers = "25Sep26";
 
 // default settings
 String str_name = "wemos";
@@ -112,11 +112,11 @@ DHT dht(4, DHT22, 15);
 // eeprom string size
 const int BUFSIZE = 20;
 
-bool bt[18],rele[18],net_default,http,count;
+bool bt[18],rele[18],http,count;
 bool state,period,blinds,shutters,buttons,sensor;
 bool revers,an_ntc,pid_rev;
 byte ac_pwm[18],pwm[18],gap,my_mqtt[4];
-byte somfy,ac_somfy,shut,ac_shut;
+byte net_default,somfy,ac_somfy,shut,ac_shut;
 int term,temp,hum,tmp,an,sn,bcount[18],pin;
 int temp_max=33, temp_min=11, temp_ntc=22;
 int pid, pid_ku, pid_tu, pid_integral, pid_last_error;
@@ -509,7 +509,6 @@ void my_web()
     String req = client.readStringUntil('\n'); //r
 //  Serial.println(req);
 
-// TODO test web API
 String topicValue = "";
 String payloadValue = "";
 Serial.println("Raw Request: " + req);
@@ -588,7 +587,7 @@ client.println(F("<br>reboot - reboot esp8266, memory - free RAM, millis - milli
 client.println(F("<br>name* - new name, ssid* - new ssid, pass* - new pass, mqtt* - IP for server"));
 client.println(F("<br>state - outputs rele14,16,pwm12,13 save after power off 0/1"));
 client.println(F("<br>http - set web server and web API | 0/1"));
-client.println(F("..http GET: /?topic_param=command&payload_param=payload "));
+client.println(F("<br>..http GET: /?topic_param=command&payload_param=payload "));
 client.println(F("<br>blinds* - set out12, out13 for blinds(somfy) | 0/1"));
 client.println(F("<br>buttons* - set out12, out13 for buttons | 0/1"));
 client.println(F("<br>shutters* - set out14, out16 for shutters | 0/1"));
@@ -870,8 +869,8 @@ client.print(F("/in/default</th><th>0,1,2</th><th>"));
 client.print(net_default);
 client.println(F("</th></tr></table><hr>"));
 
-client.print(F("<center><a href='https://github.com/hjltu/hjmqtt'>"));
-client.println(F("hjmqtt</a> 22-aug-16 -> "));
+client.print(F("<center>Github: <a href='https://github.com/hjltu'>"));
+client.println(F("hjltu</a>, Version: "));
 client.print(vers);
 client.println(F("</center></body></html>"));
 req="";
@@ -1827,18 +1826,21 @@ void my_reset()
                 rcount[0]=0;
                 rcount[2]=0;
 
-                // reset to saved STA
-                if (net_default==2)
-                    net_default=0;
-
-                // reset to default STA
-                else if (net_default==0)
+                switch (net_default)
+                {
+                case 0:
                     net_default=1;
-
-                // reset to AP
-                else
+                    break;
+                case 1:
                     net_default=2;
-
+                    break;
+                case 2:
+                    net_default=0;
+                    break;
+                default:
+                    net_default=2;
+                    break;
+                }
                 ee_wr(109,net_default);
                 my_reset_print();
             }
